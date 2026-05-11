@@ -91,7 +91,7 @@ export default function App() {
     const response = await fetch("/api/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: SYSTEM_PROMPT, messages: [{ role: "user", content: prompt }] }),
+      body: JSON.stringify({ model: "claude-3-5-sonnet-20241022", max_tokens: 1000, system: SYSTEM_PROMPT, messages: [{ role: "user", content: prompt }] }),
     });
     if (!response.ok) throw new Error(`API error: ${response.status}`);
     const data = await response.json();
