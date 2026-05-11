@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { loadShared, saveShared } from "./firebase.js";
-import { initGoogleAuth, getGmailToken, fetchGmailAlerts } from "./gmail.js";
 
 const TEAM = [
   { id: "ignacio", name: "Ignacio", color: "#00cfff", initials: "IG" },
@@ -8,37 +7,13 @@ const TEAM = [
   { id: "lucas", name: "Lucas", color: "#fb923c", initials: "LU" },
 ];
 
-// Las alertas se cargan dinámicamente desde Gmail
-
-const SYSTEM_PROMPT = `Sos un analista especializado en identificación de leads para SLG, firma de consultoría en derechos humanos empresariales con base en LATAM, también opera en Europa y USA (foco en subsidiarias latinoamericanas).
-
-SERVICIOS SLG: Due diligence DDHH, Defensa legal ante organismos internacionales (CIDH/ONU/OCDE/ICSID), Gestión riesgo reputacional, Compliance y políticas internas DDHH, Asesoría regulatoria, Capacitación interna.
-CONTACTO PREFERIDO: Área LEGAL (General Counsel, Legal Director, CLO). Secundario: Compliance/ESG/Relaciones Institucionales.
-
-CATEGORÍA 1 — RIESGO DDHH (prioridad ALTA): empresa multinacional señalada por violaciones DDHH; gobierno que permite operación empresarial con impacto en DDHH; denuncia ante organismo internacional que involucre empresa; riesgo reputacional grave de empresa grande.
-CATEGORÍA 2 — RIESGO REGULATORIO (prioridad MEDIA): nueva regulación que afecta operaciones de empresas grandes; cambios legales/multas/sanciones a multinacionales.
-DESCARTAR: sin empresa, solo personas/políticos, conflicto armado sin actor corporativo, noticias genéricas, empresas pequeñas/locales.
-SCORING: empresa multinacional nombrada +3, denuncia organismo +3, extractivo +1, riesgo reputacional alto +2, regulación multi-empresa +2, empresa pequeña -3.
-LÓGICA: denuncia activa→Defensa legal→General Counsel URGENTE; señalamiento sin denuncia→Due diligence+Reputacional→General Counsel; regulación nueva→Asesoría→General Counsel/Dir.Regulatorio; sin política DDHH→Compliance+Capacitación→CLO/CCO; múltiples empresas→Asesoría sectorial.
-
-EJEMPLO LEAD: {"es_lead":true,"categoria":1,"score":9,"empresa":"Pan American Silver","sector":"extractivo","organismo":null,"pais":"México","motivo":"Multinacional minera señalada por violaciones DDHH en México","area_contacto":"General Counsel o Director Legal subsidiaria México","servicio_principal":"Due diligence DDHH + Gestión riesgo reputacional","propuesta":"Auditoría urgente de operaciones en Zacatecas. Protocolo de respuesta ante señalamientos y potencial denuncia ante NCP canadiense u OCDE."}
-EJEMPLO DESCARTE: {"es_lead":false,"categoria":null,"score":1,"empresa":null,"sector":null,"organismo":"CIDH","pais":"Venezuela","motivo":"Sin empresa involucrada. Caso político puro.","area_contacto":null,"servicio_principal":null,"propuesta":null}
-
-Respondé SOLO JSON sin backticks: {"es_lead":bool,"categoria":1|2|null,"score":1-10,"empresa":"string|null","sector":"string|null","organismo":"string|null","pais":"string","motivo":"string","area_contacto":"string|null","servicio_principal":"string|null","propuesta":"string|null"}`;
-
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
-  const [gmailToken, setGmailToken] = useState(null);
-  const [gmailReady, setGmailReady] = useState(false);
-  const [gmailError, setGmailError] = useState(null);
   const [leads, setLeads] = useState([]);
   const [descartados, setDescartados] = useState([]);
   const [assignments, setAssignments] = useState({});
   const [feedback, setFeedback] = useState({});
   const [feedbackLog, setFeedbackLog] = useState([]);
-  const [procesando, setProcesando] = useState(false);
-  const [progreso, setProgreso] = useState(0);
-  const [total, setTotal] = useState(0);
   const [filtro, setFiltro] = useState("todos");
   const [filtroAsignado, setFiltroAsignado] = useState("todos");
   const [ultimaActualizacion, setUltimaActualizacion] = useState(null);
@@ -59,21 +34,6 @@ export default function App() {
     setSyncing(false);
   }, []);
 
-  // Inicializar Google Auth al cargar
-  useEffect(() => {
-    initGoogleAuth().then(() => setGmailReady(true)).catch(() => setGmailError("No se pudo cargar Google Auth"));
-  }, []);
-
-  const conectarGmail = useCallback(async () => {
-    try {
-      setGmailError(null);
-      const token = await getGmailToken();
-      setGmailToken(token);
-    } catch (e) {
-      setGmailError("Error al conectar Gmail. Intentá de nuevo.");
-    }
-  }, []);
-
   useEffect(() => {
     syncFromStorage();
     syncInterval.current = setInterval(syncFromStorage, 15000);
@@ -86,60 +46,9 @@ export default function App() {
     setUltimaActualizacion(ts);
   }, []);
 
-  const analizarAlerta = async (thread) => {
-    const prompt = `Analizá esta alerta:\nASUNTO: ${thread.subject}\nFECHA: ${thread.date}\nCONTENIDO: ${thread.snippet}\n\nRespondé SOLO con el JSON.`;
-    const response = await fetch("/api/claude", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-3-5-sonnet-20241022", max_tokens: 1000, system: SYSTEM_PROMPT, messages: [{ role: "user", content: prompt }] }),
-    });
-    if (!response.ok) throw new Error(`API error: ${response.status}`);
-    const data = await response.json();
-    const text = data.content?.find(b => b.type === "text")?.text || "{}";
-    return { ...JSON.parse(text.replace(/```json|```/g, "").trim()), thread_id: thread.id, subject: thread.subject, date: thread.date, snippet: thread.snippet };
-  };
-
-  const procesarAlertas = useCallback(async () => {
-    if (!currentUser) return;
-    if (!gmailToken) { setGmailError("Conectá Gmail primero"); return; }
-    setProcesando(true); setLeads([]); setDescartados([]); setProgreso(0);
-    setGmailError(null);
-
-    let threads = [];
-    try {
-      threads = await fetchGmailAlerts(gmailToken);
-    } catch (e) {
-      // Token expirado — pedir nuevo
-      try {
-        const newToken = await getGmailToken();
-        setGmailToken(newToken);
-        threads = await fetchGmailAlerts(newToken);
-      } catch {
-        setGmailError("Sesión de Gmail expirada. Reconectá.");
-        setProcesando(false);
-        return;
-      }
-    }
-
-    setTotal(threads.length);
-    const nl = [], nd = [];
-    for (let i = 0; i < threads.length; i++) {
-      try {
-        const r = await analizarAlerta(threads[i]);
-        if (r.es_lead) { nl.push(r); setLeads([...nl].sort((a, b) => b.score - a.score)); }
-        else { nd.push(r); setDescartados([...nd]); }
-      } catch (e) { console.error(e); }
-      setProgreso(i + 1);
-      await new Promise(r => setTimeout(r, 300));
-    }
-    const sorted = nl.sort((a, b) => b.score - a.score);
-    await persist(sorted, nd, assignments, feedback, feedbackLog);
-    setProcesando(false);
-  }, [currentUser, gmailToken, assignments, feedback, feedbackLog, persist]);
-
   const asignarLead = useCallback(async (leadId) => {
-    const miembro = TEAM[Math.floor(Math.random() * TEAM.length)];
-    const na = { ...assignments, [leadId]: { userId: miembro.id, userName: miembro.name, assignedAt: new Date().toLocaleString("es-AR"), assignedBy: currentUser.name } };
+    const m = TEAM[Math.floor(Math.random() * TEAM.length)];
+    const na = { ...assignments, [leadId]: { userId: m.id, userName: m.name, assignedAt: new Date().toLocaleString("es-AR"), assignedBy: currentUser.name } };
     setAssignments(na);
     await persist(leads, descartados, na, feedback, feedbackLog);
   }, [assignments, leads, descartados, feedback, feedbackLog, currentUser, persist]);
@@ -184,13 +93,12 @@ export default function App() {
   const fbNeg = Object.values(feedback).filter(v => v === "down").length;
   const sinAsignar = leads.filter(l => !assignments[l.thread_id]).length;
 
-  // ── LOGIN ──────────────────────────────────────────────────────────────────
   if (!currentUser) return (
     <div style={{ fontFamily: "'DM Mono','Courier New',monospace", background: "#08080e", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: "32px" }}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}`}</style>
       <div style={{ textAlign: "center" }}>
         <h1 style={{ fontFamily: "'Syne',sans-serif", fontSize: "36px", fontWeight: 800, color: "#fff" }}>LEAD<span style={{ color: "#00ff87" }}>RADAR</span></h1>
-        <div style={{ fontSize: "10px", color: "#303050", letterSpacing: "3px", marginTop: "6px" }}>SLG · SISTEMA COLABORATIVO</div>
+        <div style={{ fontSize: "10px", color: "#303050", letterSpacing: "3px", marginTop: "6px" }}>SLG · PANEL DEL EQUIPO</div>
       </div>
       <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", justifyContent: "center" }}>
         {TEAM.map(m => (
@@ -204,11 +112,10 @@ export default function App() {
           </button>
         ))}
       </div>
-      <div style={{ fontSize: "10px", color: "#202030", letterSpacing: "1px" }}>Datos sincronizados en tiempo real entre todo el equipo</div>
+      <div style={{ fontSize: "10px", color: "#202030", letterSpacing: "1px" }}>Los leads son cargados desde Claude · Datos en tiempo real</div>
     </div>
   );
 
-  // ── APP ────────────────────────────────────────────────────────────────────
   return (
     <div style={{ fontFamily: "'DM Mono','Courier New',monospace", background: "#08080e", minHeight: "100vh", color: "#e0e0ee" }}>
       <style>{`
@@ -228,17 +135,16 @@ export default function App() {
       <div style={{ background: "#0c0c18", borderBottom: "1px solid #181828", padding: "18px 28px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "12px" }}>
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: "9px", marginBottom: "3px" }}>
-            <div style={{ width: "7px", height: "7px", borderRadius: "50%", background: procesando ? "#ffd60a" : syncing ? "#00cfff" : "#00ff87", boxShadow: `0 0 7px ${procesando ? "#ffd60a" : syncing ? "#00cfff" : "#00ff87"}`, animation: (procesando || syncing) ? "pulse 1s infinite" : "none" }} />
+            <div style={{ width: "7px", height: "7px", borderRadius: "50%", background: syncing ? "#ffd60a" : "#00ff87", boxShadow: `0 0 7px ${syncing ? "#ffd60a" : "#00ff87"}`, animation: syncing ? "pulse 1s infinite" : "none" }} />
             <span style={{ fontSize: "9px", letterSpacing: "3px", color: "#404060" }}>
-              {procesando ? `ANALIZANDO ${progreso}/${total}` : syncing ? "SINCRONIZANDO..." : ultimaActualizacion ? `SYNC ${ultimaActualizacion}` : "LISTO"}
+              {syncing ? "SINCRONIZANDO..." : ultimaActualizacion ? `SYNC ${ultimaActualizacion}` : "CARGANDO..."}
             </span>
           </div>
           <h1 style={{ fontFamily: "'Syne',sans-serif", fontSize: "22px", fontWeight: 800, color: "#fff" }}>
             LEAD<span style={{ color: "#00ff87" }}>RADAR</span>
-            <span style={{ fontSize: "9px", fontWeight: 400, color: "#282840", letterSpacing: "3px", marginLeft: "10px" }}>SLG</span>
+            <span style={{ fontSize: "9px", fontWeight: 400, color: "#282840", letterSpacing: "3px", marginLeft: "10px" }}>SLG · PANEL EQUIPO</span>
           </h1>
         </div>
-
         <div style={{ display: "flex", gap: "14px", alignItems: "center", flexWrap: "wrap" }}>
           {[{ label: "DDHH", value: cat1.length, color: "#ff6b6b" }, { label: "REG.", value: cat2.length, color: "#ffd60a" }, { label: "SIN ASIGNAR", value: sinAsignar, color: sinAsignar > 0 ? "#ff9f43" : "#303050" }].map((s, i) => (
             <div key={i} style={{ textAlign: "center" }}>
@@ -248,45 +154,28 @@ export default function App() {
           ))}
           <div style={{ width: "1px", height: "30px", background: "#181828" }} />
           {sinAsignar > 0 && (
-            <button onClick={asignarTodos} disabled={assigningAll || procesando} style={{ background: "#ff9f4315", border: "1px solid #ff9f43", color: "#ff9f43", padding: "7px 13px", borderRadius: "3px", fontSize: "10px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>
+            <button onClick={asignarTodos} disabled={assigningAll} style={{ background: "#ff9f4315", border: "1px solid #ff9f43", color: "#ff9f43", padding: "7px 13px", borderRadius: "3px", fontSize: "10px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>
               {assigningAll ? "ASIGNANDO..." : `⚡ ASIGNAR ${sinAsignar}`}
             </button>
           )}
-          {!gmailToken ? (
-            <button onClick={conectarGmail} disabled={!gmailReady} style={{ background: "#ffffff08", border: `1px solid ${gmailReady ? "#ffffff30" : "#282838"}`, color: gmailReady ? "#cccccc" : "#404060", padding: "7px 13px", borderRadius: "3px", fontSize: "10px", letterSpacing: "1px", fontFamily: "inherit", cursor: gmailReady ? "pointer" : "default" }}>
-              📧 CONECTAR GMAIL
-            </button>
-          ) : (
-            <div style={{ padding: "7px 13px", borderRadius: "3px", background: "#00ff8710", border: "1px solid #00ff8730", fontSize: "10px", color: "#00ff87", letterSpacing: "1px" }}>
-              📧 GMAIL OK
-            </div>
-          )}
-          <button onClick={procesarAlertas} disabled={procesando} style={{ background: procesando ? "#181828" : "#00ff8715", border: `1px solid ${procesando ? "#282838" : "#00ff87"}`, color: procesando ? "#303050" : "#00ff87", padding: "7px 13px", borderRadius: "3px", fontSize: "10px", letterSpacing: "1px", fontFamily: "inherit", cursor: procesando ? "default" : "pointer" }}>
-            {procesando ? "ANALIZANDO..." : "↻ ACTUALIZAR"}
+          <button onClick={syncFromStorage} style={{ background: "#00ff8715", border: "1px solid #00ff87", color: "#00ff87", padding: "7px 13px", borderRadius: "3px", fontSize: "10px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>
+            ↻ SYNC
           </button>
           <div style={{ width: "1px", height: "30px", background: "#181828" }} />
           <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             <div style={{ width: "30px", height: "30px", borderRadius: "50%", background: `${currentUser.color}20`, border: `2px solid ${currentUser.color}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "10px", fontFamily: "'Syne',sans-serif", fontWeight: 800, color: currentUser.color }}>{currentUser.initials}</div>
             <div>
               <div style={{ fontSize: "11px", color: currentUser.color, fontWeight: 600 }}>{currentUser.name}</div>
-              <div onClick={() => setCurrentUser(null)} style={{ fontSize: "9px", color: "#303050", cursor: "pointer", textDecoration: "underline", letterSpacing: "1px" }}>cambiar</div>
+              <div onClick={() => setCurrentUser(null)} style={{ fontSize: "9px", color: "#303050", cursor: "pointer", textDecoration: "underline" }}>cambiar</div>
             </div>
           </div>
         </div>
       </div>
 
-      {/* ERROR GMAIL */}
-      {gmailError && (
-        <div style={{ background: "#ff6b6b15", borderBottom: "1px solid #ff6b6b30", padding: "8px 28px", fontSize: "11px", color: "#ff6b6b", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          ⚠ {gmailError}
-          <span onClick={() => setGmailError(null)} style={{ cursor: "pointer", fontSize: "14px", color: "#ff6b6b80" }}>✕</span>
-        </div>
-      )}
-
-      {/* PROGRESO */}
-      {procesando && (
-        <div style={{ height: "2px", background: "#181828" }}>
-          <div style={{ height: "100%", width: `${(progreso / total) * 100}%`, background: "linear-gradient(90deg,#00ff87,#00cfff)", transition: "width 0.3s", boxShadow: "0 0 6px #00ff87" }} />
+      {/* BANNER SIN LEADS */}
+      {leads.length === 0 && !syncing && (
+        <div style={{ background: "#0e0e1c", borderBottom: "1px solid #181828", padding: "12px 28px", fontSize: "11px", color: "#404060", textAlign: "center" }}>
+          Los leads son analizados desde Claude y aparecen acá automáticamente. Pedile a quien gestiona Claude que actualice las alertas.
         </div>
       )}
 
@@ -340,7 +229,7 @@ export default function App() {
 
       {/* LEADS */}
       <div style={{ padding: "20px 28px", display: "grid", gap: "11px" }}>
-        {filtrados.length === 0 && !procesando && !mostrandoDescartados && (
+        {filtrados.length === 0 && !syncing && !mostrandoDescartados && (
           <div style={{ textAlign: "center", padding: "50px", color: "#202030" }}>
             <div style={{ fontSize: "32px", marginBottom: "10px" }}>◌</div>
             <div style={{ fontSize: "10px", letterSpacing: "3px" }}>SIN LEADS EN ESTA VISTA</div>
@@ -425,7 +314,7 @@ export default function App() {
         })}
 
         {/* DESCARTADOS */}
-        {mostrandoDescartados && descartados.length === 0 && !procesando && (
+        {mostrandoDescartados && descartados.length === 0 && !syncing && (
           <div style={{ textAlign: "center", padding: "50px", color: "#202030" }}>
             <div style={{ fontSize: "32px", marginBottom: "10px" }}>◌</div>
             <div style={{ fontSize: "10px", letterSpacing: "3px" }}>SIN ALERTAS DESCARTADAS</div>
@@ -444,7 +333,7 @@ export default function App() {
                   </div>
                   <div style={{ fontSize: "12px", color: "#505068", marginBottom: "4px", fontFamily: "'Syne',sans-serif", fontWeight: 700 }}>{d.subject?.replace("Google Alert - ", "").replace("Alerta de Google: ", "")}</div>
                   <div style={{ fontSize: "11px", color: "#303048", lineHeight: 1.5 }}>{d.motivo}</div>
-                  {fb === "down" && <div style={{ marginTop: "7px", fontSize: "11px", color: "#ff6b6b", background: "#ff6b6b08", border: "1px solid #ff6b6b20", borderRadius: "2px", padding: "6px 10px" }}>⚠ Marcado como error — traeme este caso para ajustar el criterio.</div>}
+                  {fb === "down" && <div style={{ marginTop: "7px", fontSize: "11px", color: "#ff6b6b", background: "#ff6b6b08", border: "1px solid #ff6b6b20", borderRadius: "2px", padding: "6px 10px" }}>⚠ Marcado como error — informalo para ajustar el criterio.</div>}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "8px" }}>
                   <div style={{ fontSize: "10px", color: "#202030" }}>{new Date(d.date).toLocaleDateString("es-AR", { day: "2-digit", month: "short" })}</div>
