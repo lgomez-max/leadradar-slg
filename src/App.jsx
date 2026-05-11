@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { loadShared, saveShared } from "./firebase.js";
+import { initGoogleAuth, getGmailToken, fetchGmailAlerts } from "./gmail.js";
 
 const TEAM = [
   { id: "ignacio", name: "Ignacio", color: "#00cfff", initials: "IG" },
@@ -7,18 +8,7 @@ const TEAM = [
   { id: "lucas", name: "Lucas", color: "#fb923c", initials: "LU" },
 ];
 
-const GMAIL_THREADS = [
-  { id: "19e0d1c606663a6c", subject: "Pan American Silver derechos humanos", date: "2026-05-09", snippet: "Señalan intervención del crimen organizado en minas de Zacatecas, Sinaloa y Guerrero — Pan American Silver (Plata Panamericana), en Zacatecas; Americas Gold and Silver, en Cosalá, Sinaloa; Torex Gold, en Guerrero. Violaciones a derechos humanos, operan bajo presión del crimen organizado." },
-  { id: "19e083eecf454f2f", subject: "Panamerican Silver derechos humanos denuncia", date: "2026-05-08", snippet: "¿Narcosindicatos en la Minería? — Tres empresas de capital canadiense: Plata Panamericana en Zacatecas, Américas Gold and Silver... derechos humanos, operan bajo presión del crimen organizado." },
-  { id: "19e123b53a3de6e8", subject: "Denuncia CIDH", date: "2026-05-10", snippet: "Caso Goleada: Aquiles Álvarez acude a la CIDH y denuncia prisión con fines políticos. Caso Nardoni: abogado Angelo Carbone requiere que la CIDH acompañe el caso presencialmente." },
-  { id: "19e07f0940d458ca", subject: "Denuncia CIDH", date: "2026-05-08", snippet: "Venezuela: la Corte interamericana de derechos humanos pide la liberación de todos los detenidos políticos. Gobierno venezolano en el foco." },
-  { id: "19e0d21377555c12", subject: "Denuncia CIDH", date: "2026-05-09", snippet: "CIDH denuncia que en Venezuela aún hay 450 presos políticos y exige poder ingresar al país. Sin empresas involucradas." },
-  { id: "19e17317f681a980", subject: "Denuncia Naciones Unidas", date: "2026-05-11", snippet: "La ONU denuncia la muerte de 880 civiles entre enero y abril por los ataques con drones. Contexto de conflicto armado, sin empresa específica." },
-  { id: "19e0ea35b9e0ca96", subject: "Gobierno límites regulación empresas", date: "2026-05-09", snippet: "Redes, algoritmos y derechos: por qué el mundo endurece las reglas para las big tech. La Unión Europea y varios gobiernos avanzan en regulación que afecta a Meta, Google, Apple y otras tecnológicas." },
-  { id: "19e0ea35c26ea478", subject: "empresa derechos humanos", date: "2026-05-09", snippet: "Ciudadanía exige mayor responsabilidad empresarial: más de la mitad cree que las empresas deben rendir cuentas por impactos en derechos humanos. Encuesta nacional en Chile." },
-  { id: "19e0461ef04f59b3", subject: "empresa derechos humanos", date: "2026-05-07", snippet: "Trabajo avanza para implantar multas a empresas que incumplan su responsabilidad social en España. Grandes corporaciones en riesgo de sanciones." },
-  { id: "19e13c8c927411a0", subject: "empresa derechos humanos", date: "2026-05-10", snippet: "Gobierno de Baja California fortalece vínculo con empresas para impulsar derechos humanos. Iniciativa público-privada sin denuncia específica." },
-];
+// Las alertas se cargan dinámicamente desde Gmail
 
 const SYSTEM_PROMPT = `Sos un analista especializado en identificación de leads para SLG, firma de consultoría en derechos humanos empresariales con base en LATAM, también opera en Europa y USA (foco en subsidiarias latinoamericanas).
 
@@ -38,6 +28,9 @@ Respondé SOLO JSON sin backticks: {"es_lead":bool,"categoria":1|2|null,"score":
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
+  const [gmailToken, setGmailToken] = useState(null);
+  const [gmailReady, setGmailReady] = useState(false);
+  const [gmailError, setGmailError] = useState(null);
   const [leads, setLeads] = useState([]);
   const [descartados, setDescartados] = useState([]);
   const [assignments, setAssignments] = useState({});
@@ -64,6 +57,21 @@ export default function App() {
     if (data.feedbackLog) setFeedbackLog(data.feedbackLog);
     if (data.lastSync) setUltimaActualizacion(data.lastSync);
     setSyncing(false);
+  }, []);
+
+  // Inicializar Google Auth al cargar
+  useEffect(() => {
+    initGoogleAuth().then(() => setGmailReady(true)).catch(() => setGmailError("No se pudo cargar Google Auth"));
+  }, []);
+
+  const conectarGmail = useCallback(async () => {
+    try {
+      setGmailError(null);
+      const token = await getGmailToken();
+      setGmailToken(token);
+    } catch (e) {
+      setGmailError("Error al conectar Gmail. Intentá de nuevo.");
+    }
   }, []);
 
   useEffect(() => {
@@ -93,11 +101,31 @@ export default function App() {
 
   const procesarAlertas = useCallback(async () => {
     if (!currentUser) return;
-    setProcesando(true); setLeads([]); setDescartados([]); setProgreso(0); setTotal(GMAIL_THREADS.length);
-    const nl = [], nd = [];
-    for (let i = 0; i < GMAIL_THREADS.length; i++) {
+    if (!gmailToken) { setGmailError("Conectá Gmail primero"); return; }
+    setProcesando(true); setLeads([]); setDescartados([]); setProgreso(0);
+    setGmailError(null);
+
+    let threads = [];
+    try {
+      threads = await fetchGmailAlerts(gmailToken);
+    } catch (e) {
+      // Token expirado — pedir nuevo
       try {
-        const r = await analizarAlerta(GMAIL_THREADS[i]);
+        const newToken = await getGmailToken();
+        setGmailToken(newToken);
+        threads = await fetchGmailAlerts(newToken);
+      } catch {
+        setGmailError("Sesión de Gmail expirada. Reconectá.");
+        setProcesando(false);
+        return;
+      }
+    }
+
+    setTotal(threads.length);
+    const nl = [], nd = [];
+    for (let i = 0; i < threads.length; i++) {
+      try {
+        const r = await analizarAlerta(threads[i]);
         if (r.es_lead) { nl.push(r); setLeads([...nl].sort((a, b) => b.score - a.score)); }
         else { nd.push(r); setDescartados([...nd]); }
       } catch (e) { console.error(e); }
@@ -107,7 +135,7 @@ export default function App() {
     const sorted = nl.sort((a, b) => b.score - a.score);
     await persist(sorted, nd, assignments, feedback, feedbackLog);
     setProcesando(false);
-  }, [currentUser, assignments, feedback, feedbackLog, persist]);
+  }, [currentUser, gmailToken, assignments, feedback, feedbackLog, persist]);
 
   const asignarLead = useCallback(async (leadId) => {
     const miembro = TEAM[Math.floor(Math.random() * TEAM.length)];
@@ -224,6 +252,15 @@ export default function App() {
               {assigningAll ? "ASIGNANDO..." : `⚡ ASIGNAR ${sinAsignar}`}
             </button>
           )}
+          {!gmailToken ? (
+            <button onClick={conectarGmail} disabled={!gmailReady} style={{ background: "#ffffff08", border: `1px solid ${gmailReady ? "#ffffff30" : "#282838"}`, color: gmailReady ? "#cccccc" : "#404060", padding: "7px 13px", borderRadius: "3px", fontSize: "10px", letterSpacing: "1px", fontFamily: "inherit", cursor: gmailReady ? "pointer" : "default" }}>
+              📧 CONECTAR GMAIL
+            </button>
+          ) : (
+            <div style={{ padding: "7px 13px", borderRadius: "3px", background: "#00ff8710", border: "1px solid #00ff8730", fontSize: "10px", color: "#00ff87", letterSpacing: "1px" }}>
+              📧 GMAIL OK
+            </div>
+          )}
           <button onClick={procesarAlertas} disabled={procesando} style={{ background: procesando ? "#181828" : "#00ff8715", border: `1px solid ${procesando ? "#282838" : "#00ff87"}`, color: procesando ? "#303050" : "#00ff87", padding: "7px 13px", borderRadius: "3px", fontSize: "10px", letterSpacing: "1px", fontFamily: "inherit", cursor: procesando ? "default" : "pointer" }}>
             {procesando ? "ANALIZANDO..." : "↻ ACTUALIZAR"}
           </button>
@@ -237,6 +274,14 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* ERROR GMAIL */}
+      {gmailError && (
+        <div style={{ background: "#ff6b6b15", borderBottom: "1px solid #ff6b6b30", padding: "8px 28px", fontSize: "11px", color: "#ff6b6b", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          ⚠ {gmailError}
+          <span onClick={() => setGmailError(null)} style={{ cursor: "pointer", fontSize: "14px", color: "#ff6b6b80" }}>✕</span>
+        </div>
+      )}
 
       {/* PROGRESO */}
       {procesando && (
